@@ -5,9 +5,13 @@ on:
     branches: [master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: macos-15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,20 +19,31 @@ jobs:
 
       - name: Find and select Xcode with iOS SDK
         run: |
-          # List available Xcode versions
-          ls /Applications/ | grep Xcode
-          # Use latest available Xcode
-          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
-          echo "Using $XCODE_PATH"
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
           sudo xcode-select -s "$XCODE_PATH"
           xcodebuild -showsdks | grep -i ios
 
-      - name: Build llama.cpp xcframework
+      - name: Build llama.cpp for physical iPhone and iPad only
         run: |
           cd llama.cpp
-          chmod +x build-xcframework.sh
-          ./build-xcframework.sh
-          ls -la build-apple/llama.xcframework/
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('build-xcframework.sh')
+          source = path.read_text()
+          prefix = source.split('echo "Building for iOS simulator..."', 1)[0]
+          device = source.split('echo "Building for iOS devices..."', 1)[1].split('echo "Building for macOS..."', 1)[0]
+          suffix = '''
+          setup_framework_structure "build-ios-device" ${IOS_MIN_OS_VERSION} "ios"
+          combine_static_libraries "build-ios-device" "Release-iphoneos" "ios" "false"
+          mkdir -p build-apple
+          xcrun xcodebuild -create-xcframework \\
+            -framework "$(pwd)/build-ios-device/framework/llama.framework" \\
+            -debug-symbols "$(pwd)/build-ios-device/dSYMs/llama.dSYM" \\
+            -output "$(pwd)/build-apple/llama.xcframework"
+          '''
+          path.write_text(prefix + 'echo "Building for iOS devices..."\n' + device + suffix)
+          PY
+          bash build-xcframework.sh
 
       - name: Build iOS app
         run: |
@@ -43,16 +58,22 @@ jobs:
             DEVELOPMENT_TEAM="" \
             -derivedDataPath build
 
-      - name: Package IPA
+      - name: Package and check IPA
         run: |
-          APP_PATH=$(find build -name "*.app" -type d | head -1)
-          echo "Found app at: $APP_PATH"
+          APP_PATH="build/Build/Products/Release-iphoneos/CrucibleLLM.app"
+          test -f "$APP_PATH/CrucibleLLM"
+          test -f "$APP_PATH/Info.plist"
           mkdir -p Payload
-          cp -r "$APP_PATH" Payload/
-          zip -r CrucibleLLM.ipa Payload/
+          cp -R "$APP_PATH" Payload/
+          zip -qr CrucibleLLM.ipa Payload/
+          unzip -t CrucibleLLM.ipa | tail -1
+          shasum -a 256 CrucibleLLM.ipa > CrucibleLLM.ipa.sha256
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: CrucibleLLM
-          path: CrucibleLLM.ipa
+          path: |
+            CrucibleLLM.ipa
+            CrucibleLLM.ipa.sha256
+          if-no-files-found: error
